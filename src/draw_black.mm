@@ -122,7 +122,7 @@ int main() {
     [metalView setWantsLayer:YES];
     [metalView setLayer:(CALayer *)layer];
     [window setContentView:metalView];
-    [window setTitle:@"Tetsu"];
+    [window setTitle:@"draw_black"];
     [window makeKeyAndOrderFront:nil];
     [app activateIgnoringOtherApps:YES];
 
