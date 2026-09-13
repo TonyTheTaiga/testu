@@ -11,6 +11,7 @@ find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(QUARTZ_FRAMEWORK QuartzCore REQUIRED)
 find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
+find_library(METALKIT_FRAMEWORK MetalKit REQUIRED)
 
 # Every src/<name>.mm file is one independently runnable Metal experiment.
 file(GLOB APP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm")
@@ -34,6 +35,7 @@ foreach(APP_SOURCE IN LISTS APP_SOURCES)
         ${FOUNDATION_FRAMEWORK}
         ${QUARTZ_FRAMEWORK}
         ${APPKIT_FRAMEWORK}
+        ${METALKIT_FRAMEWORK}
         objc
     )
 endforeach()

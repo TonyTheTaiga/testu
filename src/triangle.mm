@@ -1,7 +1,9 @@
 #include "Foundation/NSError.hpp"
+#include "Foundation/NSObject.hpp"
 #include "Foundation/NSString.hpp"
 #include "Foundation/NSTypes.hpp"
 #include "Metal/MTL4RenderPipeline.hpp"
+#include "Metal/MTLArgument.hpp"
 #include "Metal/MTLBuffer.hpp"
 #include "Metal/MTLCommandBuffer.hpp"
 #include "Metal/MTLCommandQueue.hpp"
@@ -11,15 +13,23 @@
 #include "Metal/MTLRenderPass.hpp"
 #include "Metal/MTLRenderPipeline.hpp"
 #include "Metal/MTLResource.hpp"
+#include "Metal/MTLSampler.hpp"
 #include "QuartzCore/CAMetalDrawable.hpp"
 #include "QuartzCore/CAMetalLayer.hpp"
 #include <AppKit/AppKit.h>
 #include <Foundation/Foundation.h>
 #include <Metal/Metal.hpp>
+#include <MetalKit/MetalKit.h>
+#include <MetalKit/Metalkit.h>
 #include <QuartzCore/QuartzCore.h>
+#include <Security/cssmconfig.h>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <objc/NSObject.h>
 #include <objc/objc.h>
+#include <sstream>
 
 @interface AppDelegate : NSObject <NSApplicationDelegate> {
   MTL::Device *_device;
@@ -63,25 +73,10 @@
 
 @end
 
-const char *shaderSource = R"(
-#include <metal_stdlib>
-
-using namespace metal;
-
-vertex float4 triangleVertex(
-  uint vertexID [[vertex_id]],
-  const device float2* positions [[buffer(0)]]
-) {
-    return float4(positions[vertexID], 0.0, 1.0);
-}
-
-fragment float4 triangleFragment() {
-    return float4(1.0, 0.5, 0.0, 1.0);
-}
-)";
-
 void draw(CA::MetalLayer *layer, MTL::CommandQueue *queue,
-          MTL::Buffer *vertexBuffer, MTL::RenderPipelineState *pipeline) {
+          MTL::Buffer *vertexBuffer, MTL::Buffer *indexBuffer,
+          MTL::Buffer *uvBuffer, MTL::RenderPipelineState *pipeline,
+          MTL::Texture *texture, MTL::SamplerState *sampler) {
 
   std::cout << "looping..." << "\n";
   @autoreleasepool {
@@ -89,6 +84,11 @@ void draw(CA::MetalLayer *layer, MTL::CommandQueue *queue,
     if (!drawable) {
       return;
     }
+
+    using Clock = std::chrono::steady_clock;
+    static const auto start = Clock::now();
+
+    float seconds = std::chrono::duration<float>(Clock::now() - start).count();
 
     MTL::RenderPassDescriptor *pass =
         MTL::RenderPassDescriptor::renderPassDescriptor();
@@ -107,8 +107,13 @@ void draw(CA::MetalLayer *layer, MTL::CommandQueue *queue,
 
     encoder->setRenderPipelineState(pipeline);
     encoder->setVertexBuffer(vertexBuffer, 0, 0);
-    encoder->drawPrimitives(MTL::PrimitiveTypeLine, NS::UInteger{0},
-                            NS::UInteger{3});
+    encoder->setVertexBytes(&seconds, sizeof(seconds), 1);
+    encoder->setVertexBuffer(uvBuffer, 0, 2);
+    encoder->setFragmentTexture(texture, NS::UInteger{0});
+    encoder->setFragmentSamplerState(sampler, NS::UInteger{0});
+    encoder->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger{6},
+                                   MTL::IndexTypeUInt16, indexBuffer,
+                                   NS::UInteger{0});
 
     encoder->endEncoding();
     commandBuffer->presentDrawable(drawable);
@@ -132,9 +137,60 @@ int main() {
 
     NS::Error *error = nullptr;
 
+    NSString *path = [[[NSFileManager defaultManager] currentDirectoryPath]
+        stringByAppendingPathComponent:@"assets/textures/blue_marble.png"];
+
+    NSURL *imageURL = [NSURL fileURLWithPath:path];
+
+    id<MTLDevice> nativeDevice = (__bridge id<MTLDevice>)(void *)device;
+
+    MTKTextureLoader *loader =
+        [[MTKTextureLoader alloc] initWithDevice:nativeDevice];
+
+    NSError *imageError = nil;
+
+    id<MTLTexture> nativeTexture =
+        [loader newTextureWithContentsOfURL:imageURL
+                                    options:nil
+                                      error:&imageError];
+
+    if (!nativeTexture) {
+      std::cerr << "Texture loading failed\n";
+
+      if (imageError) {
+        std::cerr << [[imageError localizedDescription] UTF8String] << "\n";
+      }
+
+      return -1;
+    }
+
+    MTL::Texture *texture =
+        reinterpret_cast<MTL::Texture *>((__bridge void *)nativeTexture);
+
+    MTL::SamplerDescriptor *samplerDescriptor =
+        MTL::SamplerDescriptor::alloc()->init();
+
+    samplerDescriptor->setMinFilter(MTL::SamplerMinMagFilterLinear);
+    samplerDescriptor->setMagFilter(MTL::SamplerMinMagFilterLinear);
+    samplerDescriptor->setSAddressMode(MTL::SamplerAddressModeRepeat);
+    samplerDescriptor->setTAddressMode(MTL::SamplerAddressModeRepeat);
+
+    MTL::SamplerState *sampler = device->newSamplerState(samplerDescriptor);
+
+    samplerDescriptor->release();
+
+    std::ifstream shaderFile("src/triangle.metal");
+    if (!shaderFile) {
+      std::cerr << "Could not open file src/triangle.metal\n";
+    }
+
+    std::ostringstream shaderText;
+    shaderText << shaderFile.rdbuf();
+    std::string shaderSource = shaderText.str();
+
     MTL::Library *library = device->newLibrary(
-        NS::String::string(shaderSource, NS::UTF8StringEncoding), nullptr,
-        &error);
+        NS::String::string(shaderSource.c_str(), NS::UTF8StringEncoding),
+        nullptr, &error);
 
     if (!library) {
       std::cerr << "Shader compilation failed\n";
@@ -210,15 +266,37 @@ int main() {
     [window makeKeyAndOrderFront:nil];
     [app activateIgnoringOtherApps:YES];
 
-    const float pos[3][2] = {{0.0f, 0.5f}, {-0.5f, -0.5f}, {0.5f, 0.5f}};
-    MTL::Buffer *vertexBuffer =
-        device->newBuffer(pos, sizeof(pos), MTL::ResourceStorageModeShared);
+    const float positions[4][2] = {
+        {-0.5f, 0.5f},  // 0: top-left
+        {-0.5f, -0.5f}, // 1: bottom-left
+        {0.5f, 0.5f},   // 2: top-right
+        {0.5f, -0.5f}   // 3: bottom-right
+    };
+
+    const uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
+
+    const float uv[4][2] = {
+        {0.0f, 0.0f}, // vertex 0: top-left
+        {0.0f, 2.0f}, // vertex 1: bottom-left
+        {2.0f, 0.0f}, // vertex 2: top-right
+        {2.0f, 2.0f}, // vertex 3: bottom-right
+    };
+
+    MTL::Buffer *vertexBuffer = device->newBuffer(
+        positions, sizeof(positions), MTL::ResourceStorageModeShared);
+
+    MTL::Buffer *indexBuffer = device->newBuffer(
+        indices, sizeof(indices), MTL::ResourceStorageModeShared);
+
+    MTL::Buffer *uvBuffer =
+        device->newBuffer(uv, sizeof(uv), MTL::ResourceStorageModeShared);
 
     NSTimer *drawTimer = [NSTimer
         scheduledTimerWithTimeInterval:(1.0 / 60.0)
                                repeats:YES
                                  block:^(NSTimer *timer) {
-                                   draw(layer, queue, vertexBuffer, pipeline);
+                                   draw(layer, queue, vertexBuffer, indexBuffer,
+                                        uvBuffer, pipeline, texture, sampler);
                                  }];
 
     [appDelegate configureWithDevice:device
